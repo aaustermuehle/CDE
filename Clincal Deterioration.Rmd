@@ -1,0 +1,273 @@
+---
+title: "Clinical deterioration"
+author: "L. Nelson Sanchez-Pinto"
+date: "2024-05-03"
+output: html_document
+---
+
+#Libraries
+```{r}
+library(knitr)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(stringr)
+library(doBy)
+library(tableone)
+library(lme4)
+library(pROC)
+library(oddsratio)
+library(DescTools)
+library(PRROC)
+library(mfx)
+```
+
+```{r}
+# Functions for sensitivity and precision 
+
+sens <- function(x, y) {
+  t = table(x, y)
+  FN <- t[3]  # Top right: Did not meet test criteria and had event
+  TP <- t[4]  # Lower right: Met test criteria and had event
+  TP / (TP + FN)
+} 
+
+prec <- function(x, y)
+{
+  t = table(x, y)
+  FP <- t[2]  # Lower left: Met criteria and did not have outcome
+  TP <- t[4]  # Lower right: Met test criteria and had event
+  TP / (TP + FP)
+} 
+
+rate <- function(x)
+{
+  t = table(x)
+  yes <- t[2]  # cases
+  no <- t[1]  # controls
+  yes  / (yes + no)
+} 
+
+```
+
+
+```{r}
+sepsis=read.csv("C:/Users/lsanchezpinto/OneDrive - Lurie Childrens/HomeDrive/R/IPSO/cd_icu_transfer_all_sepsis_scores_v3.csv")
+
+sepsis$HOSP_ADMISSION = ymd_hms(sepsis$HOSP_ADMISSION)
+sepsis$HOSP_DISCHARGE = ymd_hms(sepsis$HOSP_DISCHARGE)
+sepsis$FLOOR_START_TIME = ymd_hms(sepsis$FLOOR_START_TIME)
+sepsis$FLOOR_END_TIME = ymd_hms(sepsis$FLOOR_END_TIME)
+sepsis$first_time_max_score = ymd_hms(sepsis$first_time_max_score)
+sepsis$first_time_score_15 = ymd_hms(sepsis$first_time_score_15)
+sepsis$first_time_score_30 = ymd_hms(sepsis$first_time_score_30)
+
+colnames(sepsis)[2] = "encounterkey"
+
+
+sepsis$first12h = as.numeric(sepsis$First.12.hours.of.admission_value)
+sepsis$first12h[is.na(sepsis$first12h)]=0
+sepsis$lethargy = as.numeric(sepsis$Lethargy..PEWS.Behavior._value)
+sepsis$lethargy[is.na(sepsis$lethargy)]=0
+sepsis$fev_hypo = as.numeric(sepsis$Fever.or.Hypothermia_value)
+sepsis$fev_hypo[is.na(sepsis$fev_hypo)]=0
+sepsis$low_sbp = as.numeric(sepsis$Systolic.hypotension_value)
+sepsis$low_sbp[is.na(sepsis$low_sbp)]=0
+sepsis$bands = as.numeric(sepsis$Bandemia_value)
+sepsis$bands[is.na(sepsis$bands)]=0
+sepsis$alt = as.numeric(sepsis$Elevated.ALT_value)
+sepsis$alt[is.na(sepsis$alt)]=0
+sepsis$hr = as.numeric(sepsis$Tachycardia_value)
+sepsis$hr[is.na(sepsis$hr)]=0
+sepsis$rr = as.numeric(sepsis$Tachypnea_value)
+sepsis$rr[is.na(sepsis$rr)]=0
+sepsis$cap_refill = as.numeric(sepsis$capillary.refill_value)
+sepsis$cap_refill[is.na(sepsis$cap_refill)]=0
+sepsis$transplant = as.numeric(sepsis$Solid.organ.transplant_value)
+sepsis$transplant[is.na(sepsis$transplant)]=0
+sepsis$immuno = as.numeric(sepsis$Immunodeficiency_value)
+sepsis$immuno[is.na(sepsis$immuno)]=0
+sepsis$tech_dep = as.numeric(sepsis$Medical.technology.dependent_value)
+sepsis$tech_dep[is.na(sepsis$tech_dep)]=0
+sepsis$cvc = as.numeric(sepsis$Central.line.or.drain_value)
+sepsis$cvc[is.na(sepsis$cvc)]=0
+
+summary(sepsis)
+
+#Correct changes in score weights
+sepsis$first12h = ifelse(sepsis$first12h >0 , 4 , 0 )
+sepsis$lethargy = ifelse(sepsis$lethargy>0  , 20, 0)
+sepsis$fev_hypo = ifelse(sepsis$fev_hypo>0  , 10, 0)
+sepsis$low_sbp = ifelse(sepsis$low_sbp >0 , 8, 0)
+sepsis$bands = ifelse(sepsis$bands >0 , 16, 0)
+sepsis$alt = ifelse(sepsis$alt>0  , 7, 0)
+sepsis$hr = ifelse(sepsis$hr>0  , 6, 0)
+sepsis$rr = ifelse(sepsis$rr >0 , 2, 0)
+sepsis$cap_refill = ifelse(sepsis$cap_refill>0  , 14, 0)
+sepsis$transplant = ifelse(sepsis$transplant>0   , 8, 0)
+sepsis$immuno = ifelse(sepsis$immuno >0 , 5, 0)
+sepsis$tech_dep = ifelse(sepsis$tech_dep >0 , 5 , 0)
+sepsis$cvc = ifelse(sepsis$cvc>0  , 4, 0)
+
+sepsis$max_sepsis_score_corr = sepsis$first12h + sepsis$lethargy + sepsis$fev_hypo + sepsis$low_sbp + sepsis$bands + sepsis$alt + sepsis$hr + sepsis$rr + sepsis$cap_refill + sepsis$transplant + sepsis$immuno + sepsis$tech_dep + sepsis$cvc 
+
+sepsis$max_sepsis_score = as.numeric(sepsis$max_sepsis_score)
+sepsis = filter(sepsis, !is.na(max_sepsis_score))
+
+sepsis = arrange(sepsis, FLOOR_START_TIME)
+sepsis = summarise(group_by(sepsis, encounterkey, HOSP_ADMISSION, FLOOR_END_TIME), HOSP_DISCHARGE =first(HOSP_DISCHARGE),  FLOOR_START_TIME=first(FLOOR_START_TIME),  first_time_max_score=first(first_time_max_score),  first_time_score_15=first(first_time_score_15),  first_time_score_30=first(first_time_score_30), max_sepsis_score = first(max_sepsis_score_corr))
+
+sepsis$epoch=  ifelse(sepsis$FLOOR_END_TIME >=ymd("2019-01-19") & sepsis$FLOOR_END_TIME <ymd("2020-03-01"), "1. Baseline",
+                    ifelse(sepsis$FLOOR_END_TIME >=ymd("2020-03-01") & sepsis$FLOOR_END_TIME <ymd("2021-10-01"), "2. Activities",
+                            ifelse(sepsis$FLOOR_END_TIME >=ymd("2021-10-01") & sepsis$FLOOR_END_TIME <ymd("2023-10-01") , "3. Post", NA)))
+
+                     
+table(sepsis$epoch)
+
+
+sepsis = filter(sepsis, !is.na(epoch))
+sepsis = filter(sepsis, !is.na(HOSP_DISCHARGE))
+
+summaryBy(max_sepsis_score ~ epoch, data=sepsis, na.rm=T, FUN=c(quantile))
+```
+
+
+```{r}
+cd = read.csv("C:/Users/lsanchezpinto/OneDrive - Lurie Childrens/HomeDrive/R/IPSO/dataset_v2_05022024.csv")
+
+cd$events = as.numeric(cd$EVENT_COUNT)
+cd = filter(cd, !is.na(events) & events>0)
+cd$FLOOR_END_TIME = ymd_hms(cd$FLOOR_END_TIME)
+
+sepsis = left_join(sepsis, cd, by=c("encounterkey", "FLOOR_END_TIME"))
+
+sepsis$events[is.na(sepsis$events)]=0
+sepsis$event = ifelse(sepsis$events>0,1, 0)
+
+sepsis$meds = as.numeric(sepsis$meds)
+sepsis$meds[is.na(sepsis$meds)]=0
+sepsis$bolus = as.numeric(sepsis$bolus)
+sepsis$bolus[is.na(sepsis$bolus)]=0
+sepsis$cv_rescue = ifelse(sepsis$bolus >0 | sepsis$meds>0,1,0)
+sepsis$intubation_2_or_more_flags = as.numeric(sepsis$intubation_2_or_more_flags)
+sepsis$intubation_2_or_more_flags[is.na(sepsis$intubation_2_or_more_flags)]=0
+sepsis$noninvasiveventilation_1_or_more_flags = as.numeric(sepsis$noninvasiveventilation_1_or_more_flags)
+sepsis$noninvasiveventilation_1_or_more_flags[is.na(sepsis$noninvasiveventilation_1_or_more_flags)]=0
+sepsis$resp_rescue = ifelse(sepsis$intubation_2_or_more_flags >0 | sepsis$noninvasiveventilation_1_or_more_flags>0,1,0)
+
+sepsis$year= year(sepsis$FLOOR_END_TIME)
+
+sepsis$max_score_to_disch =  floor(as.numeric((sepsis$HOSP_DISCHARGE - sepsis$first_time_max_score)/3600))+1 # Hours (whole or partial) from max score too discharge
+
+table(sepsis$year)
+table(sepsis$year, sepsis$event)
+
+table(sepsis$epoch)
+table(sepsis$epoch, sepsis$event)
+
+sepsis$epoch = as.factor(sepsis$epoch)
+
+
+#Is the post epoch associated with lower CV or Resp events?
+data_glm = filter(sepsis, !is.na(epoch) & epoch !="2. Activities" ) #Take out the COVID+implementation period
+data_glm$class = factor(data_glm$cv_rescue)
+model= glm(class~ epoch , data_glm,family=binomial)
+summary(model)
+exp(model$coefficients)
+or_glm(data_glm, model, incr= list(epoch =1), ci = 0.95)
+
+data_glm$class = factor(data_glm$resp_rescue)
+model= glm(class~ epoch , data_glm,family=binomial)
+summary(model)
+exp(model$coefficients)
+or_glm(data_glm, model, incr= list(epoch =1), ci = 0.95)
+
+
+#Prediction CV event (ROC for predicting CV events)
+data_glm = filter(sepsis,  epoch =="1. Baseline" )
+data_glm$class = factor(data_glm$cv_rescue)
+model= glm(class~ max_sepsis_score , data_glm,family=binomial)
+summary(model)
+score =predict(model, data_glm);
+roc = roc((na.omit(data_glm$class)), score, ci=T)
+roc
+
+data_glm = filter(sepsis,  epoch =="3. Post" )
+data_glm$class = factor(data_glm$cv_rescue)
+model= glm(class~ max_sepsis_score , data_glm, family=binomial)
+summary(model)
+score =predict(model, data_glm);
+roc = roc((na.omit(data_glm$class)), score, ci=T)
+roc
+
+#Prediction Resp event (ROC for predicting CV events)
+data_glm = filter(sepsis,  epoch =="1. Baseline" )
+data_glm$class = factor(data_glm$resp_rescue)
+model= glm(class~ max_sepsis_score , data_glm,family=binomial)
+summary(model)
+score =predict(model, data_glm);
+roc = roc((na.omit(data_glm$class)), score, ci=T)
+roc
+
+data_glm = filter(sepsis,  epoch =="3. Post" )
+data_glm$class = factor(data_glm$resp_rescue)
+model= glm(class~ max_sepsis_score , data_glm, family=binomial)
+summary(model)
+score =predict(model, data_glm);
+roc = roc((na.omit(data_glm$class)), score, ci=T)
+roc
+
+#Time from max score to discharge by epoch
+summaryBy(max_score_to_disch ~ epoch, data=data_glm, na.rm=T, FUN=c(quantile))
+kruskal.test(data_glm$max_score_to_disch, data_glm$epoch)
+model= lm(max_score_to_disch ~ epoch + max_sepsis_score, data_glm) #Linear regression adjusting for max sepsis score
+summary(model)
+model= glm(max_score_to_disch ~ epoch + max_sepsis_score, data_glm,family=poisson) #Poission regression adjusting for max sepsis score
+summary(model)
+poissonirr(max_score_to_disch ~ epoch + max_sepsis_score, data_glm)
+
+
+table(sepsis$event)
+table(sepsis$cv_rescue)
+table(sepsis$resp_rescue)
+
+table(sepsis$resp_rescue, sepsis$epoch)
+table(sepsis$cv_rescue, sepsis$epoch)
+
+summaryBy(event ~ epoch, data=sepsis, na.rm=T, FUN=c(mean))
+summaryBy(cv_rescue ~ epoch, data=sepsis, na.rm=T, FUN=c(mean))
+summaryBy(resp_rescue ~ epoch, data=sepsis, na.rm=T, FUN=c(mean))
+
+
+#Diagnostic perfromance of thresholds 
+
+sepsis$aware = ifelse(sepsis$max_sepsis_score>=15,1,0)
+sepsis$alert = ifelse(sepsis$max_sepsis_score>=30,1,0)
+
+sens(sepsis$aware, sepsis$cv_rescue)
+prec(sepsis$aware, sepsis$cv_rescue)
+sens(sepsis$alert, sepsis$cv_rescue)
+prec(sepsis$alert, sepsis$cv_rescue)
+
+rate(sepsis$cv_rescue)
+prec(sepsis$alert, sepsis$cv_rescue)/rate(sepsis$cv_rescue) #How many times is the precision for cv events above baseline
+
+1/prec(sepsis$alert, sepsis$cv_rescue) #Number needed to assess after alert to find one cv event
+1/rate(sepsis$cv_rescue) #Number needed to assess without alert to find one cv event
+
+sens(sepsis$aware, sepsis$resp_rescue)
+prec(sepsis$aware, sepsis$resp_rescue)
+sens(sepsis$alert, sepsis$resp_rescue)
+prec(sepsis$alert, sepsis$resp_rescue)
+
+rate(sepsis$resp_rescue)
+prec(sepsis$alert, sepsis$resp_rescue)/rate(sepsis$resp_rescue) #How many times is the precision for cv events above baseline
+
+1/prec(sepsis$alert, sepsis$resp_rescue) #Number needed to assess after alert to find one resp event
+1/rate(sepsis$resp_rescue) #Number needed to assess without alert to find one resp event
+
+
+
+
+```
+
