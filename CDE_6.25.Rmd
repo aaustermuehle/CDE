@@ -1,0 +1,414 @@
+---
+title: "Clinical deterioration"
+author: "A. Austermuehle"
+date: "02-09-2025"
+---
+
+#Import all necessary libraries:
+```{r}
+library(knitr)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(stringr)
+library(doBy)
+library(tableone)
+library(lme4)
+library(pROC)
+library(oddsratio)
+library(DescTools)
+library(PRROC)
+library(mfx)
+library(gt)
+library(ggplot2)
+library(flextable)
+```
+  
+
+#Import the two datasets: 
+```{r}
+sepsis = read.csv("C:/Users/paust/Documents/CDE/cd_icu_transfer_all_sepsis_scores_v4.csv")
+events = read.csv("C:/Users/paust/Documents/CDE/dataset_v2_05022024.csv")
+
+```
+
+
+#Data clean up for Sepsis dataset (part I):
+```{r} 
+#DEALING WITH DIFFERENT TIME BASED COLUMNS!
+
+#separate out pk into its individual components
+pk_split <- tibble(pk = sepsis$pk) %>%
+  separate_wider_delim(
+    pk,
+    delim = "_",
+    names = c("pk_patient_id", "pk_admit_time", "pk_discharge_time"),
+    too_few = "align_start"
+  )
+
+#Bind the new columns to the original dataframe
+sepsis <- bind_cols(sepsis, pk_split)
+
+#Move the new columns right after 'pk'for visual comparison
+sepsis <- sepsis %>%
+  relocate(pk_patient_id, pk_admit_time, pk_discharge_time, .after = pk)
+
+#Remove extra spaces in the OG pk string so we can convert to POSIX
+sepsis <- sepsis %>%
+  mutate(
+    pk_admit_time = gsub("  +", " ", pk_admit_time),
+    pk_discharge_time = gsub("  +", " ", pk_discharge_time)
+  )
+#Convert to posix: 
+sepsis <- sepsis %>%
+  mutate(
+    pk_admit_time = as.POSIXct(pk_admit_time, format = "%b %d %Y %I:%M%p", tz = "UTC"),
+    pk_discharge_time = as.POSIXct(pk_discharge_time, format = "%b %d %Y %I:%M%p", tz = "UTC")
+  )
+
+#Convert the rest of the time related columns to date-time format (from 2021-05-26 06:25:00.000 to 2021-05-26 06:25:00); this also eliminates the miliseconds (in the original dataset), so that we can compare to the pk time stamps which do not contain miliseconds
+sepsis$HOSP_ADMISSION = ymd_hms(sepsis$HOSP_ADMISSION)
+sepsis$HOSP_DISCHARGE = ymd_hms(sepsis$HOSP_DISCHARGE)
+sepsis$FLOOR_START_TIME = ymd_hms(sepsis$FLOOR_START_TIME)
+sepsis$FLOOR_END_TIME = ymd_hms(sepsis$FLOOR_END_TIME)
+sepsis$first_time_max_score = ymd_hms(sepsis$first_time_max_score)
+sepsis$first_time_score_15 = ymd_hms(sepsis$first_time_score_15)
+sepsis$first_time_score_30 = ymd_hms(sepsis$first_time_score_30)
+sepsis$hospital_admission_instant = ymd_hms(sepsis$hospital_admission_instant)
+
+#Which time stamps are the same and different? 
+#HOSP_ADMISSION = hospital_admission_instant
+#pk_admit_time = FLOOR_START_TIME but does NOT = HOSP_ADMISSION 
+sum(sepsis$pk_admit_time != sepsis$FLOOR_START_TIME, na.rm = TRUE)
+sum(sepsis$pk_admit_time != sepsis$HOSP_ADMISSION, na.rm = TRUE)
+
+
+#pk_discharge_time = FLOOR_END_TIME but does NOT = HOSP_DISCHARGE
+sum(sepsis$pk_discharge_time != sepsis$FLOOR_END_TIME, na.rm = TRUE)
+sum(sepsis$pk_discharge_time != sepsis$HOSP_DISCHARGE, na.rm = TRUE)
+
+#Is HOSP_ADMISSION ever strictly earlier than pk_admit_time: Yes, always.
+sum(
+  sepsis$HOSP_ADMISSION < sepsis$pk_admit_time &
+  sepsis$HOSP_ADMISSION != sepsis$pk_admit_time,
+  na.rm = TRUE
+)
+#IS HOSP_DISCHARGE ever earlier than pk_discharge_time: No, never. 
+sum(
+  sepsis$HOSP_DISCHARGE < sepsis$pk_discharge_time,
+  na.rm = TRUE
+)
+
+#By how many hours do HOSP_ADMISSION_TIME and FLOOR_START_TIME/pk_admit_time differ?
+sepsis <- sepsis %>%
+  mutate(
+    admit_time_diff_hrs = as.numeric(difftime(pk_admit_time, HOSP_ADMISSION, units = "hours"))
+  )
+
+ggplot(sepsis, aes(x = admit_time_diff_hrs)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "lightblue") +
+  xlim(0, 25) +
+  labs(
+    title = "Time Difference Between HOSP_ADMISSION and pk_admit_time",
+    x = "Time Difference (hours)",
+    y = "Number of Patients"
+  ) +
+  theme_minimal()
+
+#By how many hours do HOSP_DISCHARGE and FLOOR_END_TIME/pk_discharge_time differ? 
+sepsis <- sepsis %>%
+  mutate(
+    discharge_time_diff_hrs = as.numeric(difftime(pk_discharge_time, HOSP_DISCHARGE, units = "hours"))
+  )
+
+ggplot(filter(sepsis, discharge_time_diff_hrs < 0), aes(x = discharge_time_diff_hrs)) +
+  geom_histogram(binwidth = 50, color = "black", fill = "salmon") +
+  coord_cartesian(xlim = c(-1500, 0)) +
+  labs(
+    title = "Negative Time Difference: pk_discharge_time Before HOSP_DISCHARGE",
+    x = "Time Difference (hours)",
+    y = "Number of Patients"
+  ) +
+  theme_minimal()
+
+```
+
+# Data clean up for Sepsis dataset (part II)
+```{r}
+#Change the name of column 2 to encounterkey instead of EncounterKey
+colnames(sepsis)[2] = "encounterkey"
+
+#convert columns into numeric values, replace any missing values into a 0, and change the column names to shorter abbrevs (Systolic.hypotension_value becomes "low_sbp")
+sepsis$first12h = as.numeric(sepsis$First.12.hours.of.admission_value)
+sepsis$first12h[is.na(sepsis$first12h)]=0
+sepsis$lethargy = as.numeric(sepsis$Lethargy..PEWS.Behavior._value)
+sepsis$lethargy[is.na(sepsis$lethargy)]=0
+sepsis$fev_hypo = as.numeric(sepsis$Fever.or.Hypothermia_value)
+sepsis$fev_hypo[is.na(sepsis$fev_hypo)]=0
+sepsis$low_sbp = as.numeric(sepsis$Systolic.hypotension_value)
+sepsis$low_sbp[is.na(sepsis$low_sbp)]=0
+sepsis$bands = as.numeric(sepsis$Bandemia_value)
+sepsis$bands[is.na(sepsis$bands)]=0
+sepsis$alt = as.numeric(sepsis$Elevated.ALT_value)
+sepsis$alt[is.na(sepsis$alt)]=0
+sepsis$hr = as.numeric(sepsis$Tachycardia_value)
+sepsis$hr[is.na(sepsis$hr)]=0
+sepsis$rr = as.numeric(sepsis$Tachypnea_value)
+sepsis$rr[is.na(sepsis$rr)]=0
+sepsis$cap_refill = as.numeric(sepsis$capillary.refill_value)
+sepsis$cap_refill[is.na(sepsis$cap_refill)]=0
+sepsis$transplant = as.numeric(sepsis$Solid.organ.transplant_value)
+sepsis$transplant[is.na(sepsis$transplant)]=0
+sepsis$immuno = as.numeric(sepsis$Immunodeficiency_value)
+sepsis$immuno[is.na(sepsis$immuno)]=0
+sepsis$tech_dep = as.numeric(sepsis$Medical.technology.dependent_value)
+sepsis$tech_dep[is.na(sepsis$tech_dep)]=0
+sepsis$cvc = as.numeric(sepsis$Central.line.or.drain_value)
+sepsis$cvc[is.na(sepsis$cvc)]=0
+
+#Correct changes in score weights -- if the score is a value >0, assign the middle number; if 0, assign 0
+#ex, in the original spreadsheet the Lethargy..PEWS.behavior._value has values of 3, 20, and NULL; after this change the column contains either 20 (old 3s, original 20s) or 0 (null)
+sepsis$first12h = ifelse(sepsis$first12h > 0, 4, 0)
+sepsis$lethargy = ifelse(sepsis$lethargy > 0, 20, 0)
+sepsis$fev_hypo = ifelse(sepsis$fev_hypo > 0, 10, 0)
+sepsis$low_sbp = ifelse(sepsis$low_sbp > 0, 8, 0)
+sepsis$bands = ifelse(sepsis$bands > 0, 16, 0)
+sepsis$alt = ifelse(sepsis$alt > 0, 7, 0)
+sepsis$hr = ifelse(sepsis$hr > 0, 6, 0)
+sepsis$rr = ifelse(sepsis$rr > 0, 2, 0)
+sepsis$cap_refill = ifelse(sepsis$cap_refill > 0, 14, 0)
+sepsis$transplant = ifelse(sepsis$transplant > 0, 8, 0)
+sepsis$immuno = ifelse(sepsis$immuno > 0, 5, 0)
+sepsis$tech_dep = ifelse(sepsis$tech_dep > 0 ,5, 0)
+sepsis$cvc = ifelse(sepsis$cvc > 0, 4, 0)
+
+#create an aggregate score called max_sepsis_score_corr based on the addition of new weighted scores in each column: 
+sepsis$max_sepsis_score_corr = sepsis$first12h + sepsis$lethargy + sepsis$fev_hypo + sepsis$low_sbp + sepsis$bands + sepsis$alt + sepsis$hr + sepsis$rr + sepsis$cap_refill + sepsis$transplant + sepsis$immuno + sepsis$tech_dep + sepsis$cvc 
+
+#Assign each row an epoch based on date: 
+sepsis$epoch=  ifelse(sepsis$FLOOR_END_TIME >=ymd("2019-01-19") & sepsis$FLOOR_END_TIME <ymd("2020-03-01"), "1. Baseline",
+                    ifelse(sepsis$FLOOR_END_TIME >=ymd("2020-03-01") & sepsis$FLOOR_END_TIME <ymd("2021-10-01"), "2. Activities",
+                            ifelse(sepsis$FLOOR_END_TIME >=ymd("2021-10-01") & sepsis$FLOOR_END_TIME <ymd("2023-10-01") , "3. Post", NA)))
+
+no_epoch <- sepsis %>%
+  filter(is.na(epoch)) %>%
+  dplyr::select(FLOOR_END_TIME) %>%
+  distinct() %>%
+  arrange(FLOOR_END_TIME)
+
+#max_sepsis_score becomes numeric; rows with no max_sepsis_score are removed 
+sepsis$max_sepsis_score = as.numeric(sepsis$max_sepsis_score)
+sepsis = filter(sepsis, !is.na(max_sepsis_score))
+
+#Sort the rows of the sepsis data frame in ascending order of the FLOOR_START_TIME column
+sepsis = arrange(sepsis, FLOOR_START_TIME)
+
+# #Group the data by encounterkey, HOSP_ADMISSION, and FLOOR_END_TIME using group_by.
+# sepsis = summarise(group_by(sepsis, encounterkey, HOSP_ADMISSION, FLOOR_END_TIME), HOSP_DISCHARGE=first(HOSP_DISCHARGE),  FLOOR_START_TIME=first(FLOOR_START_TIME),  first_time_max_score=first(first_time_max_score),  first_time_score_15=first(first_time_score_15),  first_time_score_30=first(first_time_score_30), max_sepsis_score = first(max_sepsis_score_corr))
+
+```
+
+
+#Create an epoch summary table: 
+``` {r}
+
+total_counts <- sepsis %>%
+  filter(!is.na(epoch)) %>%
+  group_by(epoch) %>%
+  summarise(n_encounters = n(), .groups = "drop")
+
+race_ethnicity_summary <- sepsis %>%
+  filter(!is.na(epoch)) %>%
+  mutate(
+    race_clean = toupper(trimws(FIRSTRACE1)),
+    ethnicity_clean = toupper(trimws(ETHNICITY1))
+  ) %>%
+  group_by(epoch) %>%
+  summarise(
+    pct_white = round(mean(race_clean == "WHITE", na.rm = TRUE) * 100, 1),
+    pct_black = round(mean(race_clean == "BLACK/AFRICAN AMERICAN", na.rm = TRUE) * 100, 1),
+    pct_asian = round(mean(race_clean == "ASIAN", na.rm = TRUE) * 100, 1),
+    pct_native = round(mean(race_clean == "AMERICAN INDIAN/ALASKAN NATIVE", na.rm = TRUE) * 100, 1),
+    pct_pacific = round(mean(race_clean == "NATIVE HAWAIIAN/PACIFIC ISLANDER", na.rm = TRUE) * 100, 1),
+    pct_other = round(mean(race_clean %in% c("OTHER", "UNKNOWN", "MULTIPLE", "DECLINED"), na.rm = TRUE) * 100, 1),
+
+    pct_hispanic = round(mean(ethnicity_clean == "HISPANIC/LATINO", na.rm = TRUE) * 100, 1),
+    pct_non_hispanic = round(mean(ethnicity_clean == "NOT HISPANIC OR LATINO", na.rm = TRUE) * 100, 1),
+    pct_ethnicity_unknown = round(mean(ethnicity_clean %in% c("UNKNOWN", "DECLINED"), na.rm = TRUE) * 100, 1),
+    
+    .groups = "drop"
+  )
+
+medical_complexity_components <- sepsis %>%
+  filter(!is.na(epoch)) %>%
+  group_by(epoch) %>%
+  summarise(
+    pct_tech_dep = round(mean(tech_dep > 0, na.rm = TRUE) * 100, 1),
+    pct_transplant = round(mean(transplant > 0, na.rm = TRUE) * 100, 1),
+    pct_cvc = round(mean(cvc > 0, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  )
+
+epoch_summary <- sepsis %>%
+  filter(!is.na(epoch)) %>%
+  group_by(epoch) %>%
+  summarise(
+    mean_age = round(mean(AGE_yy, na.rm = TRUE), 1),
+    mean_max_score = round(mean(max_sepsis_score_corr, na.rm = TRUE), 1),
+    median_max_score = median(max_sepsis_score_corr, na.rm = TRUE),
+    sd_max_score = round(sd(max_sepsis_score_corr, na.rm = TRUE), 1),
+    min_max_score = min(max_sepsis_score_corr, na.rm = TRUE),
+    max_max_score = max(max_sepsis_score_corr, na.rm = TRUE),
+    pct_female = round(mean(Sex == "Female", na.rm = TRUE) * 100, 1),
+    
+    pct_tech_dep = round(mean(tech_dep > 0, na.rm = TRUE) * 100, 1),
+    pct_transplant = round(mean(transplant > 0, na.rm = TRUE) * 100, 1),
+    pct_cvc = round(mean(cvc > 0, na.rm = TRUE) * 100, 1),
+
+    .groups = "drop"
+  ) %>%
+  left_join(
+    sepsis %>%
+      filter(!is.na(epoch)) %>%
+      group_by(epoch) %>%
+      summarise(n_encounters = n(), .groups = "drop"),
+    by = "epoch"
+  ) %>%
+  left_join(race_ethnicity_summary, by = "epoch") %>%
+  arrange(epoch)
+
+transposed_data <- epoch_summary %>%
+  pivot_longer(
+    cols = -epoch,  # keep epoch fixed, pivot everything else
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  pivot_wider(
+    names_from = epoch,
+    values_from = value
+  )
+
+# Create flextable
+flextable_summary <- flextable(transposed_data) %>%
+  set_caption("Sepsis Cohort Characteristics by Epoch") %>%
+  autofit()
+flextable_summary
+
+
+library(officer)
+
+read_docx() %>%
+  body_add_flextable(flextable_summary) %>%
+  print(target = "sepsis_epoch_transposed.docx")
+
+#What was the distribution of max sepsis scores in each epoch? 
+ggplot(sepsis, aes(x = max_sepsis_score_corr)) +
+  geom_histogram(binwidth = 2, fill = "steelblue", color = "black") +
+  facet_wrap(~ epoch) +
+  xlim(0, 50) +  # No comma here
+  labs(
+    title = "Distribution of Max Sepsis Scores by Epoch",
+    x = "Max Sepsis Score (Corrected)",
+    y = "Number of Encounters"
+  ) +
+  theme_minimal()
+```
+
+
+
+########################################6/18: ALI stopped here#######################################33
+
+
+#Data clean up for (2) Events dataset:
+```{r}
+#Convert columns to date-time format (from 2021-05-26 06:25:00.000 to 2021-05-26 06:25:00)
+events$chunkstarttime = ymd_hms(events$chunkstarttime)
+events$chunkendtime = ymd_hms(events$chunkendtime)
+events$FLOOR_START_TIME = ymd_hms(events$FLOOR_START_TIME)
+events$FLOOR_END_TIME = ymd_hms(events$FLOOR_END_TIME)
+ 
+#Eliminate rows that are either "NULL" or 0 in the icu_transfer column, to keep only instances where the patient WAS transfered to the ICU: 
+icu_transfers <- events %>%
+  filter(icu_transfer == 1 & !is.na(icu_transfer))
+```
+
+#Merge two datasets:
+```{r}
+#Left join sepsis and icu_transfers:
+icu_transfers = left_join(icu_transfers, sepsis, by=c("encounterkey", "FLOOR_END_TIME"))
+
+#Now have a dataset called icu_transfers where each row is an icu_transfer event (4723), and all columns are present. 
+
+#Many do not have an assigned epoch (meaning their epoch time was before the start time of baseline epoch); eliminate those rows: 
+
+icu_transfers <- icu_transfers %>%
+  filter(!is.na(epoch))
+
+#write.csv(icu_transfers, "icu_transfers.csv", row.names = FALSE)
+
+```
+
+
+
+#Summarize key metrics for each epoch:
+```{r}
+epoch_summary <- icu_transfers %>%
+  group_by(epoch) %>%
+  summarise(
+    total_rows = n(),
+    deaths = sum(death_in_icu == 1, na.rm = TRUE),  # Count deaths
+    avg_age = mean(AGE_MM, na.rm = TRUE),  # Average age in months
+    percent_female = mean(Sex == "Female", na.rm = TRUE) * 100,  # % Female
+
+    # Transplant counts and percentage
+    transplant_count = sum(transplant > 0, na.rm = TRUE),
+    percent_transplant = mean(transplant > 0, na.rm = TRUE) * 100,
+
+    # Immunodeficiency counts and percentage
+    immuno_count = sum(immuno > 0, na.rm = TRUE),
+    percent_immuno = mean(immuno > 0, na.rm = TRUE) * 100,
+
+    # Technology dependence counts and percentage
+    tech_dep_count = sum(tech_dep > 0, na.rm = TRUE),
+    percent_tech_dep = mean(tech_dep > 0, na.rm = TRUE) * 100,
+
+    # Central line counts and percentage
+    cvc_count = sum(cvc > 0, na.rm = TRUE),
+    percent_cvc = mean(cvc > 0, na.rm = TRUE) * 100,
+
+    # Patients who received a bolus
+    bolus_count = sum(bolus == 1, na.rm = TRUE),
+    percent_bolus = mean(bolus == 1, na.rm = TRUE) * 100,
+
+    # Patients who received inotropes
+    inotropes_count = sum(meds == 1, na.rm = TRUE),
+    percent_inotropes = mean(meds == 1, na.rm = TRUE) * 100,
+
+    # Patients requiring ECMO
+    ecmo_count = sum(ecmo == 1, na.rm = TRUE),
+    percent_ecmo = mean(ecmo == 1, na.rm = TRUE) * 100,
+
+    # Patients who were intubated
+    intubation_count = sum(intubation_2_or_more_flags == 1, na.rm = TRUE),
+    percent_intubation = mean(intubation_2_or_more_flags == 1, na.rm = TRUE) * 100,
+
+    # Patients requiring NIPPV
+    nippv_count = sum(noninvasiveventilation_1_or_more_flags == 1, na.rm = TRUE),
+    percent_nippv = mean(noninvasiveventilation_1_or_more_flags == 1, na.rm = TRUE) * 100
+  ) %>%
+  arrange(epoch)
+
+# Count the frequency of each floor (FIRST_IP_DEP.x) per epoch
+floor_counts <- icu_transfers %>%
+  group_by(epoch, FIRST_IP_DEP.x) %>%
+  summarise(floor_count = n(), .groups = 'drop') %>%
+  pivot_wider(names_from = FIRST_IP_DEP.x, values_from = floor_count, values_fill = 0)
+
+# Merge floor counts into the epoch summary table
+epoch_summary <- left_join(epoch_summary, floor_counts, by = "epoch")
+
+# Display the table
+print(epoch_summary)
+
+```
+
