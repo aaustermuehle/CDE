@@ -1,0 +1,596 @@
+---
+title: "Clinical deterioration"
+author: "A Austermuehle"
+date: "Today"
+output: html_document
+---
+  
+  #Libraries:
+```{r}
+library(knitr)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(stringr)
+library(doBy)
+library(tableone)
+library(lme4)
+library(pROC)
+library(oddsratio)
+library(DescTools)
+library(PRROC)
+library(mfx)
+library(gt)
+library(ggplot2)
+library(flextable)
+```
+
+  #Define functions:
+```{r}
+# Functions for sensitivity and precision 
+# Define three functions: 
+# sens() → Sensitivity (a.k.a. recall or true positive rate)
+# prec() → Precision (positive predictive value)
+# rate() → Proportion of positive cases (event rate)
+
+sens <- function(x, y) {
+  t = table(x, y)
+  FN <- t[3]  # Top right: Did not meet test criteria and had event
+  TP <- t[4]  # Lower right: Met test criteria and had event
+  TP / (TP + FN)
+} 
+
+prec <- function(x, y)
+{
+  t = table(x, y)
+  FP <- t[2]  # Lower left: Met criteria and did not have outcome
+  TP <- t[4]  # Lower right: Met test criteria and had event
+  TP / (TP + FP)
+} 
+
+rate <- function(x)
+{
+  t = table(x)
+  yes <- t[2]  # cases
+  no <- t[1]  # controls
+  yes  / (yes + no)
+} 
+
+```
+
+  #Clean up times and weights of different metrics in Sepsis, then assign Epochs:
+```{r}
+sepsis=read.csv("C:/Users/aaust/OneDrive/Documents/CDE/cd_icu_transfer_all_sepsis_scores_v4.csv")
+
+#Perform datetime conversion on the columns in the Sepsis dataset. 
+sepsis$HOSP_ADMISSION = ymd_hms(sepsis$HOSP_ADMISSION)
+sepsis$HOSP_DISCHARGE = ymd_hms(sepsis$HOSP_DISCHARGE)
+sepsis$FLOOR_START_TIME = ymd_hms(sepsis$FLOOR_START_TIME)
+sepsis$FLOOR_END_TIME = ymd_hms(sepsis$FLOOR_END_TIME)
+sepsis$first_time_max_score = ymd_hms(sepsis$first_time_max_score)
+sepsis$first_time_score_15 = ymd_hms(sepsis$first_time_score_15)
+sepsis$first_time_score_30 = ymd_hms(sepsis$first_time_score_30)
+
+colnames(sepsis)[2] = "encounterkey"
+
+#In the sepsis score component columns, converts the original feature (often logical or factor) to numeric (typically resulting in 1 = present, 0 = absent); and replace any NA values with 0, assuming that a missing value means the feature was not present or not documented.
+sepsis$first12h = as.numeric(sepsis$First.12.hours.of.admission_value)
+sepsis$first12h[is.na(sepsis$first12h)]=0
+sepsis$lethargy = as.numeric(sepsis$Lethargy..PEWS.Behavior._value)
+sepsis$lethargy[is.na(sepsis$lethargy)]=0
+sepsis$fev_hypo = as.numeric(sepsis$Fever.or.Hypothermia_value)
+sepsis$fev_hypo[is.na(sepsis$fev_hypo)]=0
+sepsis$low_sbp = as.numeric(sepsis$Systolic.hypotension_value)
+sepsis$low_sbp[is.na(sepsis$low_sbp)]=0
+sepsis$bands = as.numeric(sepsis$Bandemia_value)
+sepsis$bands[is.na(sepsis$bands)]=0
+sepsis$alt = as.numeric(sepsis$Elevated.ALT_value)
+sepsis$alt[is.na(sepsis$alt)]=0
+sepsis$hr = as.numeric(sepsis$Tachycardia_value)
+sepsis$hr[is.na(sepsis$hr)]=0
+sepsis$rr = as.numeric(sepsis$Tachypnea_value)
+sepsis$rr[is.na(sepsis$rr)]=0
+sepsis$cap_refill = as.numeric(sepsis$capillary.refill_value)
+sepsis$cap_refill[is.na(sepsis$cap_refill)]=0
+sepsis$transplant = as.numeric(sepsis$Solid.organ.transplant_value)
+sepsis$transplant[is.na(sepsis$transplant)]=0
+sepsis$immuno = as.numeric(sepsis$Immunodeficiency_value)
+sepsis$immuno[is.na(sepsis$immuno)]=0
+sepsis$tech_dep = as.numeric(sepsis$Medical.technology.dependent_value)
+sepsis$tech_dep[is.na(sepsis$tech_dep)]=0
+sepsis$cvc = as.numeric(sepsis$Central.line.or.drain_value)
+sepsis$cvc[is.na(sepsis$cvc)]=0
+
+summary(sepsis)
+
+#Correct changes in score weights
+sepsis$first12h = ifelse(sepsis$first12h >0 , 4 , 0 )
+sepsis$lethargy = ifelse(sepsis$lethargy>0  , 20, 0)
+sepsis$fev_hypo = ifelse(sepsis$fev_hypo>0  , 10, 0)
+sepsis$low_sbp = ifelse(sepsis$low_sbp >0 , 8, 0)
+sepsis$bands = ifelse(sepsis$bands >0 , 16, 0)
+sepsis$alt = ifelse(sepsis$alt>0  , 7, 0)
+sepsis$hr = ifelse(sepsis$hr>0  , 6, 0)
+sepsis$rr = ifelse(sepsis$rr >0 , 2, 0)
+sepsis$cap_refill = ifelse(sepsis$cap_refill>0  , 14, 0)
+sepsis$transplant = ifelse(sepsis$transplant>0   , 8, 0)
+sepsis$immuno = ifelse(sepsis$immuno >0 , 5, 0)
+sepsis$tech_dep = ifelse(sepsis$tech_dep >0 , 5 , 0)
+sepsis$cvc = ifelse(sepsis$cvc>0  , 4, 0)
+
+sepsis$max_sepsis_score_corr = sepsis$first12h + sepsis$lethargy + sepsis$fev_hypo + sepsis$low_sbp + sepsis$bands + sepsis$alt + sepsis$hr + sepsis$rr + sepsis$cap_refill + sepsis$transplant + sepsis$immuno + sepsis$tech_dep + sepsis$cvc 
+
+sepsis$max_sepsis_score = as.numeric(sepsis$max_sepsis_score)
+sepsis = filter(sepsis, !is.na(max_sepsis_score))
+
+sepsis = arrange(sepsis, FLOOR_START_TIME)
+
+# sepsis = summarise(group_by(sepsis, encounterkey, HOSP_ADMISSION, FLOOR_END_TIME), HOSP_DISCHARGE =first(HOSP_DISCHARGE),  FLOOR_START_TIME=first(FLOOR_START_TIME),  first_time_max_score=first(first_time_max_score),  first_time_score_15=first(first_time_score_15),  first_time_score_30=first(first_time_score_30), max_sepsis_score = first(max_sepsis_score_corr))
+
+sepsis <- sepsis %>%
+  group_by(encounterkey, HOSP_ADMISSION, FLOOR_END_TIME) %>%
+  summarise(across(
+    c(
+      pk, FIRST_IP_DEP, HOSP_DISCHARGE, FLOOR_START_TIME, max_sepsis_score,
+      first_time_max_score, first_time_score_15, first_time_score_30,
+      First.12.hours.of.admission_value, BIRTHDATE, hospital_admission_instant,
+      AGE_MM, AGE_yy, Sex, FIRSTRACE1, ETHNICITY1,
+      first12h, lethargy, fev_hypo, low_sbp, bands, alt, hr, rr, cap_refill,
+      transplant, immuno, tech_dep, cvc, max_sepsis_score_corr
+    ),
+    first
+  ),
+  .groups = "drop")
+
+
+sepsis$epoch=  ifelse(sepsis$FLOOR_END_TIME >=ymd("2019-01-19") & sepsis$FLOOR_END_TIME <ymd("2020-03-01"), "1. Baseline",
+                      ifelse(sepsis$FLOOR_END_TIME >=ymd("2020-03-01") & sepsis$FLOOR_END_TIME <ymd("2021-10-01"), "2. Activities",
+                             ifelse(sepsis$FLOOR_END_TIME >=ymd("2021-10-01") & sepsis$FLOOR_END_TIME <ymd("2023-10-01") , "3. Post", NA)))
+
+
+table(sepsis$epoch)
+
+sepsis = filter(sepsis, !is.na(epoch))
+sepsis = filter(sepsis, !is.na(HOSP_DISCHARGE))
+
+summaryBy(max_sepsis_score ~ epoch, data=sepsis, na.rm=T, FUN=c(quantile))
+```
+
+#Create demographics table: 
+``` {r}
+total_counts <- sepsis %>%
+  filter(!is.na(epoch)) %>%
+  group_by(epoch) %>%
+  summarise(n_encounters = n(), .groups = "drop")
+
+race_ethnicity_summary <- sepsis %>%
+  filter(!is.na(epoch)) %>%
+  mutate(
+    race_clean = toupper(trimws(FIRSTRACE1)),
+    ethnicity_clean = toupper(trimws(ETHNICITY1))
+  ) %>%
+  group_by(epoch) %>%
+  summarise(
+    pct_white = round(mean(race_clean == "WHITE", na.rm = TRUE) * 100, 1),
+    pct_black = round(mean(race_clean == "BLACK/AFRICAN AMERICAN", na.rm = TRUE) * 100, 1),
+    pct_asian = round(mean(race_clean == "ASIAN", na.rm = TRUE) * 100, 1),
+    pct_native = round(mean(race_clean == "AMERICAN INDIAN/ALASKAN NATIVE", na.rm = TRUE) * 100, 1),
+    pct_pacific = round(mean(race_clean == "NATIVE HAWAIIAN/PACIFIC ISLANDER", na.rm = TRUE) * 100, 1),
+    pct_other = round(mean(race_clean %in% c("OTHER", "UNKNOWN", "MULTIPLE", "DECLINED"), na.rm = TRUE) * 100, 1),
+
+    pct_hispanic = round(mean(ethnicity_clean == "HISPANIC/LATINO", na.rm = TRUE) * 100, 1),
+    pct_non_hispanic = round(mean(ethnicity_clean == "NOT HISPANIC OR LATINO", na.rm = TRUE) * 100, 1),
+    pct_ethnicity_unknown = round(mean(ethnicity_clean %in% c("UNKNOWN", "DECLINED"), na.rm = TRUE) * 100, 1),
+    
+    .groups = "drop"
+  )
+
+medical_complexity_components <- sepsis %>%
+  filter(!is.na(epoch)) %>%
+  group_by(epoch) %>%
+  summarise(
+    pct_tech_dep = round(mean(tech_dep > 0, na.rm = TRUE) * 100, 1),
+    pct_transplant = round(mean(transplant > 0, na.rm = TRUE) * 100, 1),
+    pct_cvc = round(mean(cvc > 0, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  )
+
+epoch_summary <- sepsis %>%
+  filter(!is.na(epoch)) %>%
+  group_by(epoch) %>%
+  summarise(
+    mean_age = round(mean(AGE_yy, na.rm = TRUE), 1),
+    mean_max_score = round(mean(max_sepsis_score_corr, na.rm = TRUE), 1),
+    median_max_score = median(max_sepsis_score_corr, na.rm = TRUE),
+    sd_max_score = round(sd(max_sepsis_score_corr, na.rm = TRUE), 1),
+    min_max_score = min(max_sepsis_score_corr, na.rm = TRUE),
+    max_max_score = max(max_sepsis_score_corr, na.rm = TRUE),
+    pct_female = round(mean(Sex == "Female", na.rm = TRUE) * 100, 1),
+    
+    pct_tech_dep = round(mean(tech_dep > 0, na.rm = TRUE) * 100, 1),
+    pct_transplant = round(mean(transplant > 0, na.rm = TRUE) * 100, 1),
+    pct_cvc = round(mean(cvc > 0, na.rm = TRUE) * 100, 1),
+
+    .groups = "drop"
+  ) %>%
+  left_join(
+    sepsis %>%
+      filter(!is.na(epoch)) %>%
+      group_by(epoch) %>%
+      summarise(n_encounters = n(), .groups = "drop"),
+    by = "epoch"
+  ) %>%
+  left_join(race_ethnicity_summary, by = "epoch") %>%
+  arrange(epoch)
+
+transposed_data <- epoch_summary %>%
+  pivot_longer(
+    cols = -epoch,  # keep epoch fixed, pivot everything else
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  pivot_wider(
+    names_from = epoch,
+    values_from = value
+  )
+
+# Create flextable
+flextable_summary <- flextable(transposed_data) %>%
+  set_caption("Sepsis Cohort Characteristics by Epoch") %>%
+  autofit()
+flextable_summary
+
+
+library(officer)
+
+read_docx() %>%
+  body_add_flextable(flextable_summary) %>%
+  print(target = "sepsis_epoch_transposed.docx")
+
+#What was the distribution of max sepsis scores in each epoch? 
+ggplot(sepsis, aes(x = max_sepsis_score_corr)) +
+  geom_histogram(binwidth = 2, fill = "steelblue", color = "black") +
+  facet_wrap(~ epoch) +
+  xlim(0, 50) +  # No comma here
+  labs(
+    title = "Distribution of Max Sepsis Scores by Epoch",
+    x = "Max Sepsis Score (Corrected)",
+    y = "Number of Encounters"
+  ) +
+  theme_minimal()
+```
+
+
+#Merge the datasets and then count the flags: 
+```{r}
+cd = read.csv("C:/Users/aaust/OneDrive/Documents/CDE/dataset_v2_05022024.csv")
+cd$events = as.numeric(cd$EVENT_COUNT)
+cd = filter(cd, !is.na(events) & events>0)
+cd$FLOOR_END_TIME = ymd_hms(cd$FLOOR_END_TIME)
+
+sepsis = left_join(sepsis, cd, by=c("encounterkey", "FLOOR_END_TIME"))
+
+sepsis$events[is.na(sepsis$events)]=0
+sepsis$event = ifelse(sepsis$events>0,1, 0)
+
+sepsis$meds = as.numeric(sepsis$meds)
+sepsis$meds[is.na(sepsis$meds)]=0
+sepsis$bolus = as.numeric(sepsis$bolus)
+sepsis$bolus[is.na(sepsis$bolus)]=0
+sepsis$cv_rescue = ifelse(sepsis$bolus >0 | sepsis$meds>0,1,0)
+sepsis$intubation_2_or_more_flags = as.numeric(sepsis$intubation_2_or_more_flags)
+sepsis$intubation_2_or_more_flags[is.na(sepsis$intubation_2_or_more_flags)]=0
+sepsis$noninvasiveventilation_1_or_more_flags = as.numeric(sepsis$noninvasiveventilation_1_or_more_flags)
+sepsis$noninvasiveventilation_1_or_more_flags[is.na(sepsis$noninvasiveventilation_1_or_more_flags)]=0
+sepsis$resp_rescue = ifelse(sepsis$intubation_2_or_more_flags >0 | sepsis$noninvasiveventilation_1_or_more_flags>0,1,0)
+
+sepsis$year= year(sepsis$FLOOR_END_TIME)
+
+sepsis$max_score_to_disch =  floor(as.numeric((sepsis$HOSP_DISCHARGE - sepsis$first_time_max_score)/3600))+1 # Hours (whole or partial) from max score too discharge
+
+table(sepsis$year)
+table(sepsis$year, sepsis$event)
+
+table(sepsis$epoch)
+table(sepsis$epoch, sepsis$event)
+
+sepsis$epoch = as.factor(sepsis$epoch)
+
+```
+
+
+
+#Make a CDE summary table
+```{r}
+epoch_summary <- sepsis %>%
+  group_by(epoch) %>%
+  summarise(
+    total_rows = n(),
+    deaths = sum(death_in_icu == 1, na.rm = TRUE),  # Count deaths
+    avg_age = mean(AGE_MM, na.rm = TRUE),  # Average age in months
+    percent_female = mean(Sex == "Female", na.rm = TRUE) * 100,  # % Female
+
+    # Transplant counts and percentage
+    transplant_count = sum(transplant > 0, na.rm = TRUE),
+    percent_transplant = mean(transplant > 0, na.rm = TRUE) * 100,
+
+    # Immunodeficiency counts and percentage
+    immuno_count = sum(immuno > 0, na.rm = TRUE),
+    percent_immuno = mean(immuno > 0, na.rm = TRUE) * 100,
+
+    # Technology dependence counts and percentage
+    tech_dep_count = sum(tech_dep > 0, na.rm = TRUE),
+    percent_tech_dep = mean(tech_dep > 0, na.rm = TRUE) * 100,
+
+    # Central line counts and percentage
+    cvc_count = sum(cvc > 0, na.rm = TRUE),
+    percent_cvc = mean(cvc > 0, na.rm = TRUE) * 100,
+
+    # Patients who received a bolus
+    bolus_count = sum(bolus == 1, na.rm = TRUE),
+    percent_bolus = mean(bolus == 1, na.rm = TRUE) * 100,
+
+    # Patients who received inotropes
+    inotropes_count = sum(meds == 1, na.rm = TRUE),
+    percent_inotropes = mean(meds == 1, na.rm = TRUE) * 100,
+
+    # Patients requiring ECMO
+    ecmo_count = sum(ecmo == 1, na.rm = TRUE),
+    percent_ecmo = mean(ecmo == 1, na.rm = TRUE) * 100,
+
+    # Patients who were intubated
+    intubation_count = sum(intubation_2_or_more_flags == 1, na.rm = TRUE),
+    percent_intubation = mean(intubation_2_or_more_flags == 1, na.rm = TRUE) * 100,
+
+    # Patients requiring NIPPV
+    nippv_count = sum(noninvasiveventilation_1_or_more_flags == 1, na.rm = TRUE),
+    percent_nippv = mean(noninvasiveventilation_1_or_more_flags == 1, na.rm = TRUE) * 100
+  ) %>%
+  arrange(epoch)
+
+# Count the frequency of each floor (FIRST_IP_DEP.x) per epoch
+floor_counts <- sepsis %>%
+  group_by(epoch, FIRST_IP_DEP.x) %>%
+  summarise(floor_count = n(), .groups = 'drop') %>%
+  pivot_wider(names_from = FIRST_IP_DEP.x, values_from = floor_count, values_fill = 0)
+
+# Merge floor counts into the epoch summary table
+epoch_summary <- left_join(epoch_summary, floor_counts, by = "epoch")
+
+# Display the table
+print(epoch_summary)
+
+```
+
+
+#Is the post epoch associated with lower CV events?
+```{r}
+#####################################Start of CV###################################################################################
+# Make new dataset without "activities" period, call it data_glm
+data_glm = filter(sepsis, !is.na(epoch) & epoch !="2. Activities" ) #Take out the COVID+implementation period
+
+# Convert cv_rescue into a categorical outcome variable called class.
+# Assumes cv_rescue is binary (e.g., 0 = no rescue, 1 = rescue).
+data_glm$class = factor(data_glm$cv_rescue)
+
+# Fit a logistic regression model using: Outcome=class (0/1), predictor: epoch (a categorical variable with two levels), # 
+# family = binomial → for binary outcome (logistic model)
+model= glm(class~ epoch , data_glm,family=binomial)
+
+#Return a summary of the logistic regression:
+summary(model)
+exp(model$coefficients)
+#for some reason this only prints if run in console: 
+or_glm(data_glm, model, incr= list(epoch =1), ci = 0.95)
+
+#Prediction CV event (ROC for predicting CV events)
+data_glm = filter(sepsis,  epoch =="1. Baseline" )
+data_glm$class = factor(data_glm$cv_rescue)
+model= glm(class~ max_sepsis_score , data_glm,family=binomial)
+summary(model)
+score =predict(model, data_glm);
+roc = roc((na.omit(data_glm$class)), score, ci=T)
+roc
+
+data_glm = filter(sepsis,  epoch =="3. Post" )
+data_glm$class = factor(data_glm$cv_rescue)
+model= glm(class~ max_sepsis_score , data_glm, family=binomial)
+summary(model)
+score =predict(model, data_glm);
+roc = roc((na.omit(data_glm$class)), score, ci=T)
+roc
+
+#Plot the ROCs: 
+cv_data_baseline <- sepsis %>%
+  filter(epoch == "1. Baseline") %>%
+  mutate(cv_class = factor(cv_rescue))
+
+cv_model_baseline <- glm(cv_class ~ max_sepsis_score, data = cv_data_baseline, family = binomial)
+cv_score_baseline <- predict(cv_model_baseline, data = cv_data_baseline)
+cv_roc_baseline <- roc(cv_data_baseline$cv_class, cv_score_baseline, ci = TRUE)
+
+# Convert to data frame for ggplot
+df_baseline <- data.frame(
+  tpr = cv_roc_baseline$sensitivities,
+  fpr = 1 - cv_roc_baseline$specificities,
+  epoch = "Baseline"
+)
+
+cv_data_post <- sepsis %>%
+  filter(epoch == "3. Post") %>%
+  mutate(cv_class = factor(cv_rescue))
+
+cv_model_post <- glm(cv_class ~ max_sepsis_score, data = cv_data_post, family = binomial)
+cv_score_post <- predict(cv_model_post, data = cv_data_post)
+cv_roc_post <- roc(cv_data_post$cv_class, cv_score_post, ci = TRUE)
+
+# Convert to data frame
+df_post <- data.frame(
+  tpr = cv_roc_post$sensitivities,
+  fpr = 1 - cv_roc_post$specificities,
+  epoch = "Post"
+)
+
+# Combine both
+df_roc_combined <- bind_rows(df_baseline, df_post)
+
+# === Plot with ggplot2 ===
+ggplot(df_roc_combined, aes(x = fpr, y = tpr, color = epoch)) +
+  geom_line(size = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(
+    title = "ROC Curves for Predicting CV Rescue Events",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Epoch"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+#####################################End of CV###################################################################################
+```
+
+#Is the post epoch associated with lower resp events?
+```{r}
+# Make new dataset without "activities" period, call it data_glm
+data_glm = filter(sepsis, !is.na(epoch) & epoch !="2. Activities" ) #Take out the COVID+implementation period
+
+# Convert cv_rescue into a categorical outcome variable called class.
+# Assumes cv_rescue is binary (e.g., 0 = no rescue, 1 = rescue).
+data_glm$class = factor(data_glm$resp_rescue)
+
+# Fit a logistic regression model using: Outcome=class (0/1), predictor: epoch (a categorical variable with two levels), # 
+# family = binomial → for binary outcome (logistic model)
+model= glm(class~ epoch , data_glm,family=binomial)
+#Same thing for resp_rescues
+data_glm$class = factor(data_glm$resp_rescue)
+model= glm(class~ epoch , data_glm,family=binomial)
+summary(model)
+exp(model$coefficients)
+or_glm(data_glm, model, incr= list(epoch =1), ci = 0.95)
+
+
+#Prediction Resp event (ROC for predicting CV events)
+data_glm = filter(sepsis,  epoch =="1. Baseline" )
+data_glm$class = factor(data_glm$resp_rescue)
+model= glm(class~ max_sepsis_score , data_glm,family=binomial)
+summary(model)
+score =predict(model, data_glm);
+roc = roc((na.omit(data_glm$class)), score, ci=T)
+roc
+
+data_glm = filter(sepsis,  epoch =="3. Post" )
+data_glm$class = factor(data_glm$resp_rescue)
+model= glm(class~ max_sepsis_score , data_glm, family=binomial)
+summary(model)
+score =predict(model, data_glm);
+roc = roc((na.omit(data_glm$class)), score, ci=T)
+roc
+
+```
+```{r} 
+#Plot: 
+# === Respiratory Rescue: Baseline Epoch ===
+resp_data_baseline <- sepsis %>%
+  filter(epoch == "1. Baseline") %>%
+  mutate(resp_class = factor(resp_rescue))
+
+resp_model_baseline <- glm(resp_class ~ max_sepsis_score, data = resp_data_baseline, family = binomial)
+resp_score_baseline <- predict(resp_model_baseline, data = resp_data_baseline)
+resp_roc_baseline <- roc(resp_data_baseline$resp_class, resp_score_baseline, ci = TRUE)
+
+# Convert to data frame for ggplot
+df_resp_baseline <- data.frame(
+  tpr = resp_roc_baseline$sensitivities,
+  fpr = 1 - resp_roc_baseline$specificities,
+  epoch = "Baseline"
+)
+
+# === Respiratory Rescue: Post Epoch ===
+resp_data_post <- sepsis %>%
+  filter(epoch == "3. Post") %>%
+  mutate(resp_class = factor(resp_rescue))
+
+resp_model_post <- glm(resp_class ~ max_sepsis_score, data = resp_data_post, family = binomial)
+resp_score_post <- predict(resp_model_post, data = resp_data_post)
+resp_roc_post <- roc(resp_data_post$resp_class, resp_score_post, ci = TRUE)
+
+# Convert to data frame
+df_resp_post <- data.frame(
+  tpr = resp_roc_post$sensitivities,
+  fpr = 1 - resp_roc_post$specificities,
+  epoch = "Post"
+)
+
+# === Combine both for plotting ===
+df_roc_resp_combined <- bind_rows(df_resp_baseline, df_resp_post)
+
+# === Plot with ggplot2 ===
+library(ggplot2)
+
+ggplot(df_roc_resp_combined, aes(x = fpr, y = tpr, color = epoch)) +
+  geom_line(size = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(
+    title = "ROC Curves for Predicting Respiratory Rescue Events",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Epoch"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+
+
+
+```{r}
+# #Time from max score to discharge by epoch
+summaryBy(max_score_to_disch ~ epoch, data=data_glm, na.rm=T, FUN=c(quantile))
+# kruskal.test(data_glm$max_score_to_disch, data_glm$epoch)
+# model= lm(max_score_to_disch ~ epoch + max_sepsis_score, data_glm) #Linear regression adjusting for max sepsis score
+# summary(model)
+# model= glm(max_score_to_disch ~ epoch + max_sepsis_score, data_glm,family=poisson) #Poission regression adjusting for max sepsis score
+# summary(model)
+# poissonirr(max_score_to_disch ~ epoch + max_sepsis_score, data_glm)
+
+
+table(sepsis$event)
+table(sepsis$cv_rescue)
+table(sepsis$resp_rescue)
+
+table(sepsis$resp_rescue, sepsis$epoch)
+table(sepsis$cv_rescue, sepsis$epoch)
+
+summaryBy(event ~ epoch, data=sepsis, na.rm=T, FUN=c(mean))
+summaryBy(cv_rescue ~ epoch, data=sepsis, na.rm=T, FUN=c(mean))
+summaryBy(resp_rescue ~ epoch, data=sepsis, na.rm=T, FUN=c(mean))
+
+
+#Diagnostic perfromance of thresholds 
+sepsis$aware = ifelse(sepsis$max_sepsis_score>=15,1,0)
+sepsis$alert = ifelse(sepsis$max_sepsis_score>=30,1,0)
+
+sens(sepsis$aware, sepsis$cv_rescue)
+prec(sepsis$aware, sepsis$cv_rescue)
+sens(sepsis$alert, sepsis$cv_rescue)
+prec(sepsis$alert, sepsis$cv_rescue)
+
+rate(sepsis$cv_rescue)
+prec(sepsis$alert, sepsis$cv_rescue)/rate(sepsis$cv_rescue) #How many times is the precision for cv events above baseline
+
+1/prec(sepsis$alert, sepsis$cv_rescue) #Number needed to assess after alert to find one cv event
+1/rate(sepsis$cv_rescue) #Number needed to assess without alert to find one cv event
+
+sens(sepsis$aware, sepsis$resp_rescue)
+prec(sepsis$aware, sepsis$resp_rescue)
+sens(sepsis$alert, sepsis$resp_rescue)
+prec(sepsis$alert, sepsis$resp_rescue)
+
+rate(sepsis$resp_rescue)
+prec(sepsis$alert, sepsis$resp_rescue)/rate(sepsis$resp_rescue) #How many times is the precision for cv events above baseline
+
+1/prec(sepsis$alert, sepsis$resp_rescue) #Number needed to assess after alert to find one resp event
+1/rate(sepsis$resp_rescue) #Number needed to assess without alert to find one resp event
+
+```
